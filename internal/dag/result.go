@@ -12,6 +12,14 @@ import "scriptweaver/internal/core"
 type GraphResult struct {
 	GraphHash GraphHash
 
+	// TraceHash is the deterministic sha256 hex of the canonical trace bytes.
+	// Empty means tracing was disabled or trace hashing failed (trace generation is inert).
+	TraceHash string
+
+	// TraceBytes is the canonical JSON encoding of the execution trace.
+	// Nil means tracing was disabled or serialization failed (trace generation is inert).
+	TraceBytes []byte
+
 	// FinalState is the terminal state of each node by name.
 	FinalState ExecutionState
 

@@ -2,6 +2,7 @@ package dag
 
 import (
 	"context"
+	"encoding/json"
 	"reflect"
 	"runtime"
 	"sync"
@@ -94,6 +95,12 @@ func TestExecutorParallel_RespectsDeterministicOrder(t *testing.T) {
 	if !reflect.DeepEqual(parRes.ExecutionOrder, serialRes.ExecutionOrder) {
 		t.Fatalf("execution order mismatch: par=%v serial=%v", parRes.ExecutionOrder, serialRes.ExecutionOrder)
 	}
+	if parRes.TraceHash != serialRes.TraceHash {
+		t.Fatalf("trace hash mismatch: par=%s serial=%s", parRes.TraceHash, serialRes.TraceHash)
+	}
+	if !reflect.DeepEqual(parRes.TraceBytes, serialRes.TraceBytes) {
+		t.Fatalf("trace bytes mismatch: par=%s serial=%s", string(parRes.TraceBytes), string(serialRes.TraceBytes))
+	}
 }
 
 func TestExecutorParallel_StableAcrossRuns_100(t *testing.T) {
@@ -154,6 +161,12 @@ func TestExecutorParallel_StableAcrossRuns_100(t *testing.T) {
 		if !reflect.DeepEqual(res.ExecutionOrder, baseline.ExecutionOrder) {
 			t.Fatalf("run %d order mismatch: %v vs %v", i, res.ExecutionOrder, baseline.ExecutionOrder)
 		}
+		if res.TraceHash != baseline.TraceHash {
+			t.Fatalf("run %d trace hash mismatch", i)
+		}
+		if !reflect.DeepEqual(res.TraceBytes, baseline.TraceBytes) {
+			t.Fatalf("run %d trace bytes mismatch", i)
+		}
 	}
 }
 
@@ -194,5 +207,89 @@ func TestExecutorParallel_StateTransitionIntegrity_NoDuplicates(t *testing.T) {
 		if runner.counts[name] != 1 {
 			t.Fatalf("expected %q to execute once, got %d", name, runner.counts[name])
 		}
+	}
+}
+
+func TestExecutorParallel_RaceToFailure_StableSkipCauseAndTrace(t *testing.T) {
+	// Graph:
+	//   A -> C
+	//   B -> C
+	// A and B fail concurrently; C is skipped.
+	// Race-to-failure requirement: trace representation must be stable and skip cause must be deterministic.
+	g, err := NewTaskGraph(
+		[]core.Task{
+			{Name: "A", Inputs: []string{"a"}, Run: "run-a"},
+			{Name: "B", Inputs: []string{"b"}, Run: "run-b"},
+			{Name: "C", Inputs: []string{"c"}, Run: "run-c"},
+		},
+		[]Edge{{From: "A", To: "C"}, {From: "B", To: "C"}},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Alternate delays to flip which task fails first.
+	patterns := []map[string]time.Duration{
+		{"A": 5 * time.Millisecond, "B": 1 * time.Millisecond},
+		{"A": 1 * time.Millisecond, "B": 5 * time.Millisecond},
+	}
+
+	var baseline *GraphResult
+	for i := 0; i < 20; i++ {
+		delays := patterns[i%len(patterns)]
+		runner := &sleepyCountingRunner{
+			delay: delays,
+			exit:  map[string]int{"A": 11, "B": 7},
+		}
+		exec, err := NewExecutor(g, runner)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		res, err := exec.RunParallel(context.Background(), 2)
+		if err != nil {
+			t.Fatalf("run %d unexpected error: %v", i, err)
+		}
+
+		if baseline == nil {
+			baseline = res
+		} else {
+			if res.TraceHash != baseline.TraceHash {
+				t.Fatalf("run %d trace hash mismatch", i)
+			}
+			if !reflect.DeepEqual(res.TraceBytes, baseline.TraceBytes) {
+				t.Fatalf("run %d trace bytes mismatch", i)
+			}
+		}
+	}
+
+	// Decode once and assert C's skip cause is deterministic.
+	type decodedEvent struct {
+		Kind        string `json:"kind"`
+		TaskID      string `json:"taskId"`
+		Reason      string `json:"reason"`
+		CauseTaskID string `json:"causeTaskId"`
+	}
+	type decodedTrace struct {
+		Events []decodedEvent `json:"events"`
+	}
+	var tr decodedTrace
+	if err := json.Unmarshal(baseline.TraceBytes, &tr); err != nil {
+		t.Fatalf("unmarshal trace: %v", err)
+	}
+	found := false
+	for _, e := range tr.Events {
+		if e.Kind == "TaskSkipped" && e.TaskID == "C" {
+			found = true
+			if e.Reason != "UpstreamFailed" {
+				t.Fatalf("expected reason UpstreamFailed, got %q", e.Reason)
+			}
+			// Canonical cause selection: min upstream failing task ID => "A".
+			if e.CauseTaskID != "A" {
+				t.Fatalf("expected deterministic causeTaskId=A, got %q", e.CauseTaskID)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected TaskSkipped for C")
 	}
 }

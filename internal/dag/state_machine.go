@@ -65,21 +65,21 @@ func isAllowedTransition(from, to TaskState) bool {
 // Safety:
 //   - If a downstream node is already RUNNING, this is treated as an invariant
 //     violation (it indicates a missing synchronization/locking bug).
-func FailAndPropagate(g *TaskGraph, state ExecutionState, taskName string) error {
+func FailAndPropagate(g *TaskGraph, state ExecutionState, taskName string) ([]string, error) {
 	if g == nil {
-		return fmt.Errorf("nil graph")
+		return nil, fmt.Errorf("nil graph")
 	}
 	node, ok := g.nodesByName[taskName]
 	if !ok {
-		return fmt.Errorf("unknown task: %q", taskName)
+		return nil, fmt.Errorf("unknown task: %q", taskName)
 	}
 
 	cur, ok := state[taskName]
 	if !ok {
-		return fmt.Errorf("unknown task in state: %q", taskName)
+		return nil, fmt.Errorf("unknown task in state: %q", taskName)
 	}
 	if cur != TaskRunning && cur != TaskFailed {
-		return fmt.Errorf("cannot fail %q from state %s", taskName, cur)
+		return nil, fmt.Errorf("cannot fail %q from state %s", taskName, cur)
 	}
 	if cur == TaskRunning {
 		state[taskName] = TaskFailed
@@ -88,6 +88,8 @@ func FailAndPropagate(g *TaskGraph, state ExecutionState, taskName string) error
 	start := node.canonicalIndex
 	visited := make([]bool, len(g.nodes))
 	visited[start] = true
+
+	skipped := make([]string, 0)
 
 	hq := &intMinHeap{}
 	heap.Init(hq)
@@ -105,14 +107,15 @@ func FailAndPropagate(g *TaskGraph, state ExecutionState, taskName string) error
 		name := g.nodes[u].Name
 		st, ok := state[name]
 		if !ok {
-			return fmt.Errorf("missing state for %q", name)
+			return nil, fmt.Errorf("missing state for %q", name)
 		}
 
 		switch st {
 		case TaskPending:
 			state[name] = TaskSkipped
+			skipped = append(skipped, name)
 		case TaskRunning:
-			return fmt.Errorf("invariant violation: downstream task %q is RUNNING during failure propagation", name)
+			return nil, fmt.Errorf("invariant violation: downstream task %q is RUNNING during failure propagation", name)
 		default:
 			// Terminal or non-pending (e.g., already skipped). Leave unchanged.
 		}
@@ -124,5 +127,5 @@ func FailAndPropagate(g *TaskGraph, state ExecutionState, taskName string) error
 		}
 	}
 
-	return nil
+	return skipped, nil
 }

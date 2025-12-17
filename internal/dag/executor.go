@@ -8,7 +8,52 @@ import (
 
 	"scriptweaver/internal/core"
 	"scriptweaver/internal/incremental"
+	"scriptweaver/internal/trace"
+
+	"container/heap"
 )
+
+// downstreamReachable returns all downstream dependent task names reachable from start (excluding start).
+//
+// Determinism:
+// The traversal is ordered by node canonical index using a min-heap.
+// This makes the returned list independent of map iteration and execution timing.
+func downstreamReachable(g *TaskGraph, start string) ([]string, error) {
+	if g == nil {
+		return nil, fmt.Errorf("nil graph")
+	}
+	n, ok := g.nodesByName[start]
+	if !ok {
+		return nil, fmt.Errorf("unknown task: %q", start)
+	}
+
+	startIdx := n.canonicalIndex
+	visited := make([]bool, len(g.nodes))
+	visited[startIdx] = true
+
+	hq := &intMinHeap{}
+	heap.Init(hq)
+	for _, d := range g.outgoing[startIdx] {
+		heap.Push(hq, d)
+	}
+
+	out := make([]string, 0)
+	for hq.Len() > 0 {
+		u := heap.Pop(hq).(int)
+		if visited[u] {
+			continue
+		}
+		visited[u] = true
+		out = append(out, g.nodes[u].Name)
+		for _, v := range g.outgoing[u] {
+			if !visited[v] {
+				heap.Push(hq, v)
+			}
+		}
+	}
+
+	return out, nil
+}
 
 // TaskRunner executes a single task.
 //
@@ -81,11 +126,34 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 		ctx = context.Background()
 	}
 
+	rec := trace.NewRecorder()
+	skipCause := make(map[string]string)
+
 	order := make([]string, 0, len(e.Graph.nodes))
 	taskHashes := make(map[string]core.TaskHash, len(e.Graph.nodes))
 	stdout := make(map[string][]byte, len(e.Graph.nodes))
 	stderr := make(map[string][]byte, len(e.Graph.nodes))
 	exitCodes := make(map[string]int, len(e.Graph.nodes))
+
+	// noteSkipped updates the stable skip cause for all currently-skipped downstream nodes.
+	// This is crucial for the "race to failure" case: if multiple upstream failures can skip the same node,
+	// we choose a deterministic cause independent of completion ordering.
+	noteSkipped := func(cause string) error {
+		downstream, err := downstreamReachable(e.Graph, cause)
+		if err != nil {
+			return err
+		}
+		for _, name := range downstream {
+			if e.state[name] != TaskSkipped {
+				continue
+			}
+			prev, ok := skipCause[name]
+			if !ok || cause < prev {
+				skipCause[name] = cause
+			}
+		}
+		return nil
+	}
 
 	for {
 		// 1) Lock state + 2) poll scheduler
@@ -104,9 +172,26 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 			e.mu.Unlock()
 
 			if allTerminal {
+				graphHash := e.Graph.Hash().String()
+				// Emit deferred TaskSkipped events in deterministic order.
+				skippedNames := make([]string, 0, len(skipCause))
+				for name := range skipCause {
+					skippedNames = append(skippedNames, name)
+				}
+				sort.Strings(skippedNames)
+				for _, name := range skippedNames {
+					trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskSkipped, TaskID: name, Reason: "UpstreamFailed", CauseTaskID: skipCause[name]})
+				}
+
+				execTrace := rec.Trace(graphHash)
+				traceBytes, _ := execTrace.CanonicalJSON()
+				traceHash := trace.ComputeTraceHash(traceBytes)
+
 				final := e.StateSnapshot()
 				return &GraphResult{
 					GraphHash:      e.Graph.Hash(),
+					TraceHash:     traceHash,
+					TraceBytes:    traceBytes,
 					FinalState:     final,
 					ExecutionOrder: order,
 					TaskHashes:     taskHashes,
@@ -125,6 +210,9 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 		if e.Plan != nil {
 			decision := e.Plan.Decisions[next]
 			if decision == incremental.DecisionReuseCache {
+				// Logical decision: cache reuse (explicitly records why the task was not executed).
+				trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskCached, TaskID: next, Reason: "PlannedReuseCache"})
+
 				// Treat restoration as a deterministic "run" step so failures propagate via Sprint-01 rules.
 				if err := Transition(e.state, next, TaskPending, TaskRunning); err != nil {
 					e.mu.Unlock()
@@ -146,7 +234,15 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 					order = append(order, next)
 					stderr[next] = []byte(err.Error())
 					exitCodes[next] = 1
-					if ferr := FailAndPropagate(e.Graph, e.state, next); ferr != nil {
+					trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: next})
+					ferr := func() error {
+						_, err := FailAndPropagate(e.Graph, e.state, next)
+						if err != nil {
+							return err
+						}
+						return noteSkipped(next)
+					}()
+					if ferr != nil {
 						e.mu.Unlock()
 						return nil, ferr
 					}
@@ -158,7 +254,15 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 					order = append(order, next)
 					stderr[next] = []byte("nil restore result")
 					exitCodes[next] = 1
-					if ferr := FailAndPropagate(e.Graph, e.state, next); ferr != nil {
+					trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: next})
+					ferr := func() error {
+						_, err := FailAndPropagate(e.Graph, e.state, next)
+						if err != nil {
+							return err
+						}
+						return noteSkipped(next)
+					}()
+					if ferr != nil {
 						e.mu.Unlock()
 						return nil, ferr
 					}
@@ -174,6 +278,7 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 				exitCodes[next] = res.ExitCode
 
 				if res.ExitCode == 0 {
+					trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskArtifactsRestored, TaskID: next, Reason: "CacheRestore"})
 					if err := Transition(e.state, next, TaskRunning, TaskCompleted); err != nil {
 						e.mu.Unlock()
 						return nil, err
@@ -181,7 +286,11 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 					e.mu.Unlock()
 					continue
 				}
-				if err := FailAndPropagate(e.Graph, e.state, next); err != nil {
+				trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: next})
+				if _, err := FailAndPropagate(e.Graph, e.state, next); err == nil {
+					err = noteSkipped(next)
+				}
+				if err != nil {
 					e.mu.Unlock()
 					return nil, err
 				}
@@ -213,6 +322,7 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 				exitCodes[next] = runRes.ExitCode
 
 				if runRes.ExitCode == 0 {
+					trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskExecuted, TaskID: next, Reason: "PlannedExecute"})
 					if err := Transition(e.state, next, TaskRunning, TaskCompleted); err != nil {
 						e.mu.Unlock()
 						return nil, err
@@ -220,7 +330,11 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 					e.mu.Unlock()
 					continue
 				}
-				if err := FailAndPropagate(e.Graph, e.state, next); err != nil {
+				trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: next})
+				if _, err := FailAndPropagate(e.Graph, e.state, next); err == nil {
+					err = noteSkipped(next)
+				}
+				if err != nil {
 					e.mu.Unlock()
 					return nil, err
 				}
@@ -244,6 +358,8 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 				e.mu.Unlock()
 				return nil, err
 			}
+			trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskCached, TaskID: next, Reason: "CacheHit"})
+			trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskArtifactsRestored, TaskID: next, Reason: "CacheReplay"})
 			taskHashes[next] = probeRes.Hash
 			stdout[next] = probeRes.Stdout
 			stderr[next] = probeRes.Stderr
@@ -276,6 +392,7 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 		exitCodes[next] = runRes.ExitCode
 
 		if runRes.ExitCode == 0 {
+			trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskExecuted, TaskID: next, Reason: "FreshWork"})
 			if err := Transition(e.state, next, TaskRunning, TaskCompleted); err != nil {
 				e.mu.Unlock()
 				return nil, err
@@ -285,7 +402,11 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 		}
 
 		// Failure: mark failed and propagate skipped.
-		if err := FailAndPropagate(e.Graph, e.state, next); err != nil {
+		trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: next})
+		if _, err := FailAndPropagate(e.Graph, e.state, next); err == nil {
+			err = noteSkipped(next)
+		}
+		if err != nil {
 			e.mu.Unlock()
 			return nil, err
 		}
@@ -320,6 +441,26 @@ func (e *Executor) RunParallel(ctx context.Context, concurrency int) (*GraphResu
 	}
 	if concurrency <= 0 {
 		return nil, fmt.Errorf("concurrency must be > 0")
+	}
+
+	rec := trace.NewRecorder()
+	skipCause := make(map[string]string)
+
+	noteSkipped := func(cause string) error {
+		downstream, err := downstreamReachable(e.Graph, cause)
+		if err != nil {
+			return err
+		}
+		for _, name := range downstream {
+			if e.state[name] != TaskSkipped {
+				continue
+			}
+			prev, ok := skipCause[name]
+			if !ok || cause < prev {
+				skipCause[name] = cause
+			}
+		}
+		return nil
 	}
 
 	maxDepth := 0
@@ -446,6 +587,8 @@ func (e *Executor) RunParallel(ctx context.Context, concurrency int) (*GraphResu
 							stopWorkers()
 							return nil, err
 						}
+						trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskCached, TaskID: name, Reason: "CacheHit"})
+						trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskArtifactsRestored, TaskID: name, Reason: "CacheReplay"})
 						taskHashes[name] = res.Hash
 						stdout[name] = res.Stdout
 						stderr[name] = res.Stderr
@@ -453,6 +596,11 @@ func (e *Executor) RunParallel(ctx context.Context, concurrency int) (*GraphResu
 						nextToStart++
 						continue
 					}
+				}
+
+				if reuseCache {
+						// Logical decision: cache reuse (explicitly records why the task was not executed).
+						trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskCached, TaskID: name, Reason: "PlannedReuseCache"})
 				}
 
 				if err := Transition(e.state, name, TaskPending, TaskRunning); err != nil {
@@ -503,16 +651,37 @@ func (e *Executor) RunParallel(ctx context.Context, concurrency int) (*GraphResu
 				exitCodes[r.name] = r.result.ExitCode
 
 				if r.result.ExitCode == 0 {
+					if e.Plan != nil && (e.Plan.Decisions[r.name] == incremental.DecisionReuseCache) {
+						trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskArtifactsRestored, TaskID: r.name, Reason: "CacheRestore"})
+						// Do NOT emit TaskExecuted for cached reuse.
+						if err := Transition(e.state, r.name, TaskRunning, TaskCompleted); err != nil {
+							e.mu.Unlock()
+							stopWorkers()
+							return nil, err
+						}
+						inFlight--
+						e.mu.Unlock()
+						continue
+					}
+					trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskExecuted, TaskID: r.name, Reason: "FreshWork"})
 					if err := Transition(e.state, r.name, TaskRunning, TaskCompleted); err != nil {
 						e.mu.Unlock()
 						stopWorkers()
 						return nil, err
 					}
 				} else {
-					if err := FailAndPropagate(e.Graph, e.state, r.name); err != nil {
+					trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: r.name})
+						ferr := func() error {
+							_, err := FailAndPropagate(e.Graph, e.state, r.name)
+							if err != nil {
+								return err
+							}
+							return noteSkipped(r.name)
+						}()
+						if ferr != nil {
 						e.mu.Unlock()
 						stopWorkers()
-						return nil, err
+							return nil, ferr
 					}
 				}
 				inFlight--
@@ -524,8 +693,24 @@ func (e *Executor) RunParallel(ctx context.Context, concurrency int) (*GraphResu
 	stopWorkers()
 
 	final := e.StateSnapshot()
+	graphHash := e.Graph.Hash().String()
+	// Emit deferred TaskSkipped events in deterministic order.
+	skippedNames := make([]string, 0, len(skipCause))
+	for name := range skipCause {
+		skippedNames = append(skippedNames, name)
+	}
+	sort.Strings(skippedNames)
+	for _, name := range skippedNames {
+		trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskSkipped, TaskID: name, Reason: "UpstreamFailed", CauseTaskID: skipCause[name]})
+	}
+
+	execTrace := rec.Trace(graphHash)
+	traceBytes, _ := execTrace.CanonicalJSON()
+	traceHash := trace.ComputeTraceHash(traceBytes)
 	return &GraphResult{
 		GraphHash:      e.Graph.Hash(),
+		TraceHash:     traceHash,
+		TraceBytes:    traceBytes,
 		FinalState:     final,
 		ExecutionOrder: order,
 		TaskHashes:     taskHashes,

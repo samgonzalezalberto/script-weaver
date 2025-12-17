@@ -65,7 +65,7 @@ func TestFailurePropagation_CascadeFailure_MarksDownstreamSkipped(t *testing.T) 
 		"D": TaskPending, // independent
 	}
 
-	if err := FailAndPropagate(g, state, "A"); err != nil {
+	if _, err := FailAndPropagate(g, state, "A"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -111,7 +111,7 @@ func TestFailurePropagation_Diamond_DownstreamSkippedNotFailed(t *testing.T) {
 		"D": TaskPending,
 	}
 
-	if err := FailAndPropagate(g, state, "A"); err != nil {
+	if _, err := FailAndPropagate(g, state, "A"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -140,7 +140,7 @@ func TestFailurePropagation_DetectsRunningDownstreamInvariantViolation(t *testin
 		"B": TaskRunning,
 	}
 
-	if err := FailAndPropagate(g, state, "A"); err == nil {
+	if _, err := FailAndPropagate(g, state, "A"); err == nil {
 		t.Fatalf("expected error")
 	}
 }

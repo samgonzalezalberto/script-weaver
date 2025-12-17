@@ -2,6 +2,7 @@ package dag
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -54,6 +55,9 @@ func TestExecutorSerial_IncrementalPlan_MixedCachedAndExecuted_RestorationFeedsD
 	if res1.FinalState["A"] != TaskCompleted || res1.FinalState["B"] != TaskCompleted {
 		t.Fatalf("expected completed on first run, got: %v", res1.FinalState)
 	}
+	if len(res1.TraceBytes) == 0 || res1.TraceHash == "" {
+		t.Fatalf("expected trace bytes/hash on run 1")
+	}
 
 	// Delete artifacts to force restoration + execution to prove correctness.
 	if err := os.Remove(filepath.Join(workDir, "a.txt")); err != nil {
@@ -87,6 +91,56 @@ func TestExecutorSerial_IncrementalPlan_MixedCachedAndExecuted_RestorationFeedsD
 	}
 	if res2.FinalState["B"] != TaskCompleted {
 		t.Fatalf("expected B completed (executed), got %s", res2.FinalState["B"])
+	}
+	if len(res2.TraceBytes) == 0 || res2.TraceHash == "" {
+		t.Fatalf("expected trace bytes/hash on run 2")
+	}
+	if string(res1.TraceBytes) == string(res2.TraceBytes) {
+		t.Fatalf("expected incremental trace to differ from clean trace when events differ")
+	}
+
+	// Decode trace JSON to assert explicit "why not executed" and deterministic restore events.
+	type decodedEvent struct {
+		Kind        string   `json:"kind"`
+		TaskID      string   `json:"taskId"`
+		Reason      string   `json:"reason"`
+		CauseTaskID string   `json:"causeTaskId"`
+		Artifacts   []string `json:"artifacts"`
+	}
+	type decodedTrace struct {
+		GraphHash string         `json:"graphHash"`
+		Events    []decodedEvent `json:"events"`
+	}
+
+	var tr decodedTrace
+	if err := json.Unmarshal(res2.TraceBytes, &tr); err != nil {
+		t.Fatalf("unmarshal trace: %v", err)
+	}
+	if tr.GraphHash == "" {
+		t.Fatalf("expected graphHash in trace")
+	}
+
+	// Expectations:
+	// - A: TaskCached with reason PlannedReuseCache
+	// - A: TaskArtifactsRestored with reason CacheRestore
+	// - A: MUST NOT have TaskExecuted
+	// - B: TaskExecuted with reason PlannedExecute
+	seen := map[string]bool{}
+	for _, e := range tr.Events {
+		key := e.TaskID + ":" + e.Kind + ":" + e.Reason
+		seen[key] = true
+		if e.TaskID == "A" && e.Kind == "TaskExecuted" {
+			t.Fatalf("expected A to be cached (not executed), but saw TaskExecuted")
+		}
+	}
+	if !seen["A:TaskCached:PlannedReuseCache"] {
+		t.Fatalf("missing expected cached reason event for A")
+	}
+	if !seen["A:TaskArtifactsRestored:CacheRestore"] {
+		t.Fatalf("missing expected artifacts restored event for A")
+	}
+	if !seen["B:TaskExecuted:PlannedExecute"] {
+		t.Fatalf("missing expected executed event for B")
 	}
 
 	// Verify B could consume A's restored artifact.

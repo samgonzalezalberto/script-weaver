@@ -2,7 +2,10 @@
 package core
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -63,11 +66,9 @@ func (r *Replayer) Replay(entry *CacheEntry) (*ReplayResult, error) {
 		return nil, fmt.Errorf("cache entry is nil")
 	}
 
-	// Restore artifacts to workspace
-	for _, artifact := range entry.Artifacts {
-		if err := r.restoreArtifact(artifact); err != nil {
-			return nil, fmt.Errorf("restoring artifact %q: %w", artifact.Path, err)
-		}
+	restored, err := r.RestoreArtifacts(entry.Hash.String(), entry)
+	if err != nil {
+		return nil, err
 	}
 
 	return &ReplayResult{
@@ -75,16 +76,64 @@ func (r *Replayer) Replay(entry *CacheEntry) (*ReplayResult, error) {
 		Stderr:            entry.Stderr,
 		ExitCode:          entry.ExitCode,
 		Hash:              entry.Hash,
-		ArtifactsRestored: len(entry.Artifacts),
+		ArtifactsRestored: restored,
 	}, nil
 }
 
+// RestoreArtifacts ensures the workspace artifacts for a cached task are present and correct.
+//
+// Sprint-02 requirement:
+//   - Check if expected output files exist with correct content hashes.
+//   - If missing or mismatched, restore from cache using an atomic write/replace.
+//   - Fail hard if an artifact cannot be retrieved from cache.
+//
+// taskID is used only for error messages.
+func (r *Replayer) RestoreArtifacts(taskID string, entry *CacheEntry) (int, error) {
+	if r == nil {
+		return 0, fmt.Errorf("replayer is nil")
+	}
+	if entry == nil {
+		return 0, fmt.Errorf("cache entry is nil")
+	}
+
+	restored := 0
+	for _, artifact := range entry.Artifacts {
+		if artifact.Path == "" {
+			return restored, fmt.Errorf("task %q: artifact path is empty", taskID)
+		}
+		if artifact.Content == nil {
+			return restored, fmt.Errorf("task %q: artifact %q missing content in cache entry", taskID, artifact.Path)
+		}
+
+		targetPath, err := r.targetPathForArtifact(artifact.Path)
+		if err != nil {
+			return restored, fmt.Errorf("task %q: resolving artifact %q target path: %w", taskID, artifact.Path, err)
+		}
+
+		wantHash := sha256Hex(artifact.Content)
+		haveHash, ok, err := fileSHA256HexIfExists(targetPath)
+		if err != nil {
+			return restored, fmt.Errorf("task %q: hashing existing artifact %q: %w", taskID, artifact.Path, err)
+		}
+		if ok && haveHash == wantHash {
+			continue
+		}
+
+		if err := atomicWriteFile(targetPath, artifact.Content, 0644); err != nil {
+			return restored, fmt.Errorf("task %q: restoring artifact %q: %w", taskID, artifact.Path, err)
+		}
+		restored++
+	}
+
+	return restored, nil
+}
+
 // restoreArtifact writes a cached artifact to the workspace.
-func (r *Replayer) restoreArtifact(artifact CachedArtifact) error {
+func (r *Replayer) targetPathForArtifact(artifactPath string) (string, error) {
 	// Determine target path
-	targetPath := artifact.Path
-	if !filepath.IsAbs(artifact.Path) {
-		targetPath = filepath.Join(r.WorkingDir, artifact.Path)
+	targetPath := artifactPath
+	if !filepath.IsAbs(artifactPath) {
+		targetPath = filepath.Join(r.WorkingDir, artifactPath)
 	}
 
 	// Convert forward slashes to OS path separator
@@ -93,13 +142,60 @@ func (r *Replayer) restoreArtifact(artifact CachedArtifact) error {
 	// Create parent directories
 	parentDir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
-		return fmt.Errorf("creating parent directory: %w", err)
+		return "", fmt.Errorf("creating parent directory: %w", err)
 	}
 
-	// Write artifact content (bit-for-bit identical)
-	if err := os.WriteFile(targetPath, artifact.Content, 0644); err != nil {
-		return fmt.Errorf("writing artifact: %w", err)
+	return targetPath, nil
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func fileSHA256HexIfExists(path string) (hash string, exists bool, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", true, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), true, nil
+}
+
+// atomicWriteFile writes content to path by writing to a temp file in the same directory
+// and then renaming it over the destination.
+func atomicWriteFile(path string, content []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	tmp, err := os.CreateTemp(dir, base+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
 	}
 
-	return nil
+	return os.Rename(tmpName, path)
 }

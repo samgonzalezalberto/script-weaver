@@ -322,3 +322,59 @@ func TestCache_NoTimestampsStored(t *testing.T) {
 		t.Errorf("metadata contains timestamp-like fields: %s", content)
 	}
 }
+
+func TestFileCache_PutIsCrashSafe_ReplacesCorruptEntry(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "cache-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cache := NewFileCache(tmpDir)
+	hash := TaskHash("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+
+	// Simulate a crash leaving a corrupt metadata.json at the canonical entry path.
+	entryDir := filepath.Join(tmpDir, "ab", string(hash))
+	if err := os.MkdirAll(filepath.Join(entryDir, "artifacts"), 0755); err != nil {
+		t.Fatalf("mkdir entry: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(entryDir, "metadata.json"), []byte("{not valid json"), 0644); err != nil {
+		t.Fatalf("write corrupt metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(entryDir, "artifacts", "0.blob"), []byte("old"), 0644); err != nil {
+		t.Fatalf("write old blob: %v", err)
+	}
+
+	// A Get should fail due to corruption.
+	if _, err := cache.Get(hash); err == nil {
+		t.Fatalf("expected Get to fail for corrupt entry")
+	}
+
+	// A new Put should replace the entire entry atomically with valid data.
+	entry := &CacheEntry{
+		Hash:     hash,
+		Stdout:   []byte("stdout"),
+		Stderr:   []byte("stderr"),
+		ExitCode: 0,
+		Artifacts: []CachedArtifact{
+			{Path: "out.txt", Content: []byte("new")},
+		},
+	}
+	if err := cache.Put(entry); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	retrieved, err := cache.Get(hash)
+	if err != nil {
+		t.Fatalf("Get failed after Put: %v", err)
+	}
+	if retrieved.ExitCode != 0 {
+		t.Fatalf("unexpected exit code: %d", retrieved.ExitCode)
+	}
+	if !bytes.Equal(retrieved.Stdout, entry.Stdout) {
+		t.Fatalf("stdout mismatch")
+	}
+	if len(retrieved.Artifacts) != 1 || !bytes.Equal(retrieved.Artifacts[0].Content, []byte("new")) {
+		t.Fatalf("artifact mismatch")
+	}
+}

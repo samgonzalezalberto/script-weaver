@@ -143,17 +143,37 @@ func (c *FileCache) Put(entry *CacheEntry) error {
 	}
 
 	entryDir := c.entryPath(entry.Hash)
-	artifactsDir := filepath.Join(entryDir, "artifacts")
+	parentDir := filepath.Dir(entryDir)
 
-	// Create directories
-	if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+	// Ensure parent exists so temp dir is created on the same filesystem.
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return fmt.Errorf("creating cache directory: %w", err)
 	}
 
-	// Write artifact blobs first (so metadata only written if blobs succeed)
+	// Write into a temp entry dir, then rename into place.
+	// This prevents crashes from leaving corrupt metadata.json (or partial blobs)
+	// at the canonical entry path.
+	tmpDir, err := os.MkdirTemp(parentDir, "tmp-entry-"+string(entry.Hash)+"-")
+	if err != nil {
+		return fmt.Errorf("creating temp cache entry dir: %w", err)
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	artifactsDir := filepath.Join(tmpDir, "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0755); err != nil {
+		return fmt.Errorf("creating cache artifacts dir: %w", err)
+	}
+
+	// Write artifact blobs first (so metadata only appears after blobs succeed).
 	for i, artifact := range entry.Artifacts {
 		blobPath := filepath.Join(artifactsDir, fmt.Sprintf("%d.blob", i))
-		if err := os.WriteFile(blobPath, artifact.Content, 0644); err != nil {
+		if err := writeFileAtomic(blobPath, artifact.Content, 0644); err != nil {
 			return fmt.Errorf("writing artifact %d: %w", i, err)
 		}
 	}
@@ -179,12 +199,45 @@ func (c *FileCache) Put(entry *CacheEntry) error {
 		return fmt.Errorf("marshaling cache metadata: %w", err)
 	}
 
-	metadataPath := filepath.Join(entryDir, "metadata.json")
-	if err := os.WriteFile(metadataPath, data, 0644); err != nil {
+	metadataPath := filepath.Join(tmpDir, "metadata.json")
+	if err := writeFileAtomic(metadataPath, data, 0644); err != nil {
 		return fmt.Errorf("writing cache metadata: %w", err)
 	}
 
+	// Best-effort remove of any existing entry; a crash between remove and rename
+	// yields a cache miss (safe), not corruption.
+	_ = os.RemoveAll(entryDir)
+	if err := os.Rename(tmpDir, entryDir); err != nil {
+		return fmt.Errorf("committing cache entry: %w", err)
+	}
+	committed = true
 	return nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, base+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	_ = tmp.Sync() // best-effort durability
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // entryPath returns the directory path for a cache entry.

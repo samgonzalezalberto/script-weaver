@@ -82,8 +82,25 @@ type Executor struct {
 	// If nil, the executor uses Runner.Probe to decide cache reuse.
 	Plan *incremental.IncrementalPlan
 
+	// Observer is an optional hook invoked when a task reaches a successful terminal state.
+	//
+	// This enables durable checkpoint persistence during execution, which is required for
+	// crash recovery semantics (system failure resumable if checkpoints exist).
+	Observer NodeObserver
+
 	mu    sync.Mutex
 	state ExecutionState
+}
+
+// NodeObserver is an optional execution observer.
+//
+// OnTaskTerminal is invoked after a task reaches a successful terminal state
+// (COMPLETED or CACHED) with exit code 0.
+//
+// The traceEvents are a point-in-time snapshot of the trace recorder.
+// Implementations must be deterministic and should avoid heavy IO.
+type NodeObserver interface {
+	OnTaskTerminal(task core.Task, result *NodeResult, traceEvents []trace.TraceEvent) error
 }
 
 // NewExecutor creates an executor with all nodes initialized to PENDING.
@@ -283,7 +300,14 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 						e.mu.Unlock()
 						return nil, err
 					}
+					obs := e.Observer
+					traceSnap := rec.Snapshot()
 					e.mu.Unlock()
+					if obs != nil {
+						if err := obs.OnTaskTerminal(task, res, traceSnap); err != nil {
+							return nil, err
+						}
+					}
 					continue
 				}
 				trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: next})
@@ -327,7 +351,14 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 						e.mu.Unlock()
 						return nil, err
 					}
+					obs := e.Observer
+					traceSnap := rec.Snapshot()
 					e.mu.Unlock()
+					if obs != nil {
+						if err := obs.OnTaskTerminal(task, runRes, traceSnap); err != nil {
+							return nil, err
+						}
+					}
 					continue
 				}
 				trace.SafeRecord(rec, trace.TraceEvent{Kind: trace.EventTaskFailed, TaskID: next})
@@ -364,7 +395,14 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 			stdout[next] = probeRes.Stdout
 			stderr[next] = probeRes.Stderr
 			exitCodes[next] = probeRes.ExitCode
+			obs := e.Observer
+			traceSnap := rec.Snapshot()
 			e.mu.Unlock()
+			if obs != nil && probeRes.ExitCode == 0 {
+				if err := obs.OnTaskTerminal(task, probeRes, traceSnap); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 
@@ -397,7 +435,14 @@ func (e *Executor) RunSerial(ctx context.Context) (*GraphResult, error) {
 				e.mu.Unlock()
 				return nil, err
 			}
+			obs := e.Observer
+			traceSnap := rec.Snapshot()
 			e.mu.Unlock()
+			if obs != nil {
+				if err := obs.OnTaskTerminal(task, runRes, traceSnap); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 

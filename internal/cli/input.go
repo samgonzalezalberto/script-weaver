@@ -22,6 +22,7 @@ type ExecutionMode string
 const (
 	ExecutionModeClean       ExecutionMode = "clean"
 	ExecutionModeIncremental ExecutionMode = "incremental"
+	ExecutionModeResumeOnly  ExecutionMode = "resume-only"
 )
 
 type TraceConfig struct {
@@ -87,7 +88,7 @@ func ParseInvocation(args []string) (CLIInvocation, error) {
 	fs.StringVar(&cacheDir, "cache-dir", "", "Cache directory. Required.")
 	fs.StringVar(&outputDir, "output-dir", "", "Output directory. Required.")
 	fs.StringVar(&tracePath, "trace", "", "Trace output path (optional).")
-	fs.StringVar(&mode, "mode", string(ExecutionModeIncremental), "Execution mode: clean|incremental")
+	fs.StringVar(&mode, "mode", string(ExecutionModeIncremental), "Execution mode: clean|incremental|resume-only")
 
 	// We intentionally do not accept environment-derived defaults.
 	if err := fs.Parse(args); err != nil {
@@ -160,12 +161,12 @@ func ParseInvocation(args []string) (CLIInvocation, error) {
 func parseExecutionMode(raw string) (ExecutionMode, error) {
 	n := strings.ToLower(strings.TrimSpace(raw))
 	switch ExecutionMode(n) {
-	case ExecutionModeClean, ExecutionModeIncremental:
+	case ExecutionModeClean, ExecutionModeIncremental, ExecutionModeResumeOnly:
 		return ExecutionMode(n), nil
 	case "":
 		return "", invalidInvocationf("--mode is required")
 	default:
-		return "", invalidInvocationf("invalid --mode %q (expected clean|incremental)", raw)
+		return "", invalidInvocationf("invalid --mode %q (expected clean|incremental|resume-only)", raw)
 	}
 }
 

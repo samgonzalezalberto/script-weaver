@@ -112,6 +112,25 @@ func TestParseInvocation_IgnoresEnvironmentVariables(t *testing.T) {
 	}
 }
 
+func TestParseInvocation_AllowsResumeOnlyMode(t *testing.T) {
+	workDir := t.TempDir()
+	args := []string{
+		"--workdir", workDir,
+		"--graph", "g.json",
+		"--cache-dir", "cache",
+		"--output-dir", "out",
+		"--mode", "resume-only",
+	}
+
+	inv, err := ParseInvocation(args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inv.ExecutionMode != ExecutionModeResumeOnly {
+		t.Fatalf("expected mode %q got %q", ExecutionModeResumeOnly, inv.ExecutionMode)
+	}
+}
+
 func TestParseInvocation_WorkDirIsMandatoryAndAbsolute(t *testing.T) {
 	_, err := ParseInvocation([]string{"--graph", "g", "--cache-dir", "c", "--output-dir", "o"})
 	if err == nil {
